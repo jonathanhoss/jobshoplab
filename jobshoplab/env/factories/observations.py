@@ -15,6 +15,7 @@ from jobshoplab.types.state_types import (
     OperationState,
     OperationStateState,
     StateMachineResult,
+    Time,
 )
 from jobshoplab.utils.exceptions import InvalidValue
 from jobshoplab.utils.logger import get_logger
@@ -925,3 +926,291 @@ class TasselJsspObservation(ObservationFactory):
             str: The string representation of the OperationArrayObservation.
         """
         return f"OperationArrayObservation with observation_space {self.observation_space}"
+
+
+class GnnObservationFactory(ObservationFactory):
+    def __init__(self, loglevel: int, config: Config, instance: InstanceConfig, *args, **kwargs):
+        """
+        GNN observation provider for the Operation–Machine Bipartite Graph.
+
+        Each node represents either:
+        - an operation (job–machine pair), or
+        - a machine (resource node).
+
+        Edges connect:
+        - successive operations in the same job (precedence edges)
+        - each operation to its assigned machine (resource edges)
+
+        Output:
+        node_feats: [num_ops + num_machines, feat_dim]
+        edge_index: [2, num_edges]
+        """
+        super().__init__(loglevel, config, instance)
+        self.max_nodes = 42
+        self.num_node_feats = 3
+        self.max_edges = 102
+        self.observation_space = gym.spaces.Dict(
+            {
+                "node_feats": gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(self.max_nodes, self.num_node_feats),
+                    dtype=np.float32,
+                ),
+                "edge_index": gym.spaces.Box(
+                    low=0, high=self.max_nodes - 1, shape=(2, self.max_edges), dtype=np.int64
+                ),
+            }
+        )
+        for name, val in kwargs.items():
+            setattr(self, name, val)
+
+    def _build_precedence_edges(self, state: State) -> list[tuple[int, int]]:
+        """
+        Build precedence edges connecting successive operations within each job.
+
+        In a job shop scheduling problem, operations within a job must be executed
+        sequentially. This method creates directed edges from operation i to operation i+1
+        for each job, representing the precedence constraint.
+
+        Args:
+            state (State): The current simulation state containing job and operation information.
+
+        Returns:
+            list[tuple[int, int]]: List of (source_node, target_node) tuples representing
+                                   directed precedence edges between operations.
+        """
+        precedence_edges = []
+        node_idx = 0
+
+        for job in state.jobs:
+            # For each job, connect consecutive operations
+            for op_idx in range(len(job.operations) - 1):
+                # Edge from current operation to next operation
+                source_node = node_idx + op_idx
+                target_node = node_idx + op_idx + 1
+                precedence_edges.append((source_node, target_node))
+
+            # Move to next job's starting node index
+            node_idx += len(job.operations)
+
+        return precedence_edges
+
+    def _build_operation_machine_edges(self, state: State) -> list[tuple[int, int]]:
+        """
+        Build operation-machine edges for the GNN graph.
+
+        Creates bidirectional edges between each operation node and its corresponding
+        machine node. Operation nodes are indexed first (0 to total_ops-1), followed
+        by machine nodes (total_ops to total_ops+num_machines-1).
+
+        Args:
+            state: Current state containing jobs and their operations
+
+        Returns:
+            list[tuple[int, int]]: List of tuples (source_idx, target_idx) representing
+                                   bidirectional edges between operations and machines.
+        """
+        operation_machine_edges = []
+        node_idx = 0
+        total_operations = sum(len(job.operations) for job in state.jobs)
+
+        # Build mapping of machine_id to machine node index
+        machine_id_to_node_idx = {}
+        for machine_idx, machine in enumerate(sorted(state.machines, key=lambda m: m.id)):
+            machine_node_idx = total_operations + machine_idx
+            machine_id_to_node_idx[machine.id] = machine_node_idx
+
+        # Create bidirectional edges between operations and their machines
+        for job in state.jobs:
+            for op in job.operations:
+                operation_node_idx = node_idx
+                machine_node_idx = machine_id_to_node_idx[op.machine_id]
+
+                # Bidirectional edges: operation -> machine and machine -> operation
+                operation_machine_edges.append((operation_node_idx, machine_node_idx))
+                operation_machine_edges.append((machine_node_idx, operation_node_idx))
+
+                node_idx += 1
+
+        return operation_machine_edges
+
+    def _calculate_operation_lower_bounds(self, state: State) -> dict[tuple[str, str], float]:
+        """
+        Calculate the lower bound per operation by cumulating job constraints.
+
+        For each operation, the lower bound is calculated as:
+        - If previous operations in the same job are scheduled: max(last_scheduled_completion, cumulative_duration)
+        - If previous operations are not scheduled: cumulative duration from job start
+
+        Example:
+        - Operation J0O0 (duration=3): lower_bound = 3
+        - Operation J0O1 (duration=2): lower_bound = 5 (3+2)
+        - If J0O0 was scheduled and finished at 10: J0O1 lower_bound = 12 (max(10, 0) + 2)
+
+        Args:
+            state: Current state containing jobs and their operations
+
+        Returns:
+            Dictionary mapping (job_id, op_id) to lower bound time
+        """
+        lower_bounds = {}
+
+        for job in state.jobs:
+            cumulative_duration = 0.0
+            last_completion = 0.0
+
+            for op_idx, op in enumerate(job.operations):
+                # Get the operation duration from the instance
+                op_config = next(
+                    o
+                    for o in self.instance.instance.specification[get_id_int(job.id)].operations
+                    if o.id == op.id
+                )
+                op_duration = op_config.duration.time
+
+                # Check if any previous operations in this job have been scheduled/completed
+                if isinstance(op.start_time, Time) and isinstance(op.end_time, Time):
+                    # Operation is already scheduled/completed
+                    last_completion = op.end_time.time
+                    lower_bounds[(job.id, op.id)] = op.end_time.time
+                elif last_completion > 0:
+                    # Previous operations were scheduled, use their completion time
+                    lower_bounds[(job.id, op.id)] = last_completion + op_duration
+                    last_completion = last_completion + op_duration
+                else:
+                    # No previous operations scheduled, use cumulative duration
+                    cumulative_duration += op_duration
+                    lower_bounds[(job.id, op.id)] = cumulative_duration
+                    last_completion = cumulative_duration
+
+        return lower_bounds
+
+    def _calculate_machine_load_progress(self, state: State) -> dict[str, float]:
+        """
+        Calculate the load progress for each machine.
+
+        Load progress is defined as the ratio of scheduled/completed operations
+        to total operations assigned to that machine across all jobs.
+
+        Formula: progress = num_scheduled_ops / total_ops_for_machine
+
+        Where:
+        - num_scheduled_ops: operations that have been scheduled (have start_time)
+        - total_ops_for_machine: all operations in the instance assigned to this machine
+
+        Example:
+        - Machine M0 has 5 total operations across all jobs
+        - 3 operations have been scheduled (started or completed)
+        - Load progress = 3/5 = 0.6
+
+        Args:
+            state: Current state containing jobs and machines
+
+        Returns:
+            Dictionary mapping machine_id to load progress [0.0, 1.0]
+        """
+        machine_load_progress = {}
+
+        # Get all scheduled operations (those with start_time set)
+        scheduled_ops = set()
+        for job in state.jobs:
+            for op in job.operations:
+                if isinstance(op.start_time, Time):
+                    scheduled_ops.add(op.id)
+
+        # Calculate progress for each machine
+        for machine in state.machines:
+            # Find all operations assigned to this machine across all jobs
+            ops_for_machine = []
+            for job in state.jobs:
+                for op in job.operations:
+                    if op.machine_id == machine.id:
+                        ops_for_machine.append(op.id)
+
+            # Calculate progress
+            if len(ops_for_machine) > 0:
+                num_sched = sum(1 for op_id in ops_for_machine if op_id in scheduled_ops)
+                progress = num_sched / len(ops_for_machine)
+            else:
+                progress = 0.0
+
+            machine_load_progress[machine.id] = progress
+
+        return machine_load_progress
+
+    def from_2d_to_1d_index(self, row: int, col: int, num_cols: int) -> int:
+        """Convert from row col into 1d index (row-major)
+
+        Args:
+            row (int): Row index.
+            col (int): Column index.
+            num_cols (int): Number of columns.
+
+        Returns:
+            int: 1D index.
+        """
+        return row * num_cols + col
+
+    def make(
+        self,
+        state_result: StateMachineResult,
+        *args,
+        **kwargs,
+    ) -> np.ndarray:
+        """
+        Create a dummy observation.
+        Args:
+            state (State): The state to create the observation from.
+        Returns:
+            Observation: The dummy observation.
+        """
+        feats = np.zeros((self.max_nodes, self.num_node_feats), dtype=np.float32)
+        edges = np.zeros((2, self.max_edges), dtype=np.int64)
+
+        # Operation nodes
+        lower_bounds = self._calculate_operation_lower_bounds(state_result.state)
+        for job_idx, job in enumerate(state_result.state.jobs):
+            for op_idx, op in enumerate(job.operations):
+                idx = self.from_2d_to_1d_index(job_idx, op_idx, len(job.operations))
+                feats[idx, 0] = lower_bounds[(job.id, op.id)]
+                feats[idx, 1] = 1.0 if isinstance(op.start_time, Time) else 0.0
+                feats[idx, 2] = 0.0  # is_machine flag
+
+        feats[:, 0] /= 55  # Normalize lower bounds
+
+        # Machine nodes
+        machine_load_progress = self._calculate_machine_load_progress(state_result.state)
+        for machine_idx, machine in enumerate(state_result.state.machines):
+            node_idx = sum(len(job.operations) for job in state_result.state.jobs) + machine_idx
+            feats[node_idx, 0] = machine_load_progress[machine.id]
+            feats[node_idx, 1] = 0.0  # unused feature
+            feats[node_idx, 2] = 1.0  # is_machine flag
+
+        # Build all edges
+        precedence_edges = self._build_precedence_edges(state_result.state)
+        operation_machine_edges = self._build_operation_machine_edges(state_result.state)
+
+        # Combine all edges
+        all_edges = precedence_edges + operation_machine_edges
+
+        # Populate edge index
+        for edge_idx, (source, target) in enumerate(all_edges):
+            if edge_idx < self.max_edges:
+                edges[0, edge_idx] = source
+                edges[1, edge_idx] = target
+            else:
+                raise Warning("Exceeded max edges, truncating edge list.")
+
+        return {
+            "node_feats": feats,
+            "edge_index": edges,
+        }
+
+    def __repr__(self) -> str:
+        """
+        Return a string representation of the GnnObservationFactory.
+
+        Returns:
+            str: The string representation of the GnnObservationFactory.
+        """

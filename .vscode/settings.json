@@ -1,0 +1,81 @@
+{
+    "python.defaultInterpreterPath": "./.venv/Scripts/python.exe",
+    "python.terminal.activateEnvironment": true,
+
+    // Black formatter settings
+    "python.formatting.provider": "black",
+    "python.formatting.blackArgs": [
+        "--line-length=88",
+        "--target-version=py39"
+    ],
+
+    // isort settings
+    "python.sortImports.args": [
+        "--profile=black",
+        "--line-length=88"
+    ],
+
+    // Linting settings
+    "python.linting.enabled": true,
+    "python.linting.flake8Enabled": true,
+    "python.linting.mypyEnabled": true,
+    "python.linting.pylintEnabled": false,
+
+    // Flake8 settings
+    "python.linting.flake8Args": [
+        "--max-line-length=88",
+        "--extend-ignore=E203,W503,E501"
+    ],
+
+    // MyPy settings
+    "python.linting.mypyArgs": [
+        "--ignore-missing-imports",
+        "--show-column-numbers"
+    ],
+
+    // Auto-formatting settings
+    "editor.formatOnSave": true,
+    "editor.formatOnPaste": false,
+    "editor.formatOnType": false,
+
+    // Python-specific settings
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        },
+        "editor.rulers": [88]
+    },
+
+    // File associations
+    "files.associations": {
+        "*.py": "python"
+    },
+
+    // Test discovery
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+
+    // Exclude patterns
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/htmlcov": true,
+        "**/.coverage": true
+    },
+
+    // Search exclude patterns
+    "search.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/htmlcov": true
+    },
+}
