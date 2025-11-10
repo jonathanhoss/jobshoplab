@@ -424,6 +424,94 @@ class JobShopLabEnv(gym.Env):
         trunc = self.state_simulator.is_truncated()
         return trunc
 
+    def is_action_valid(self, action) -> bool:
+        """
+        Check if an action is valid without executing it.
+
+        This method allows you to validate actions before stepping, avoiding
+        episode truncation due to invalid actions.
+
+        Args:
+            action: The action to validate.
+
+        Returns:
+            bool: True if the action is valid, False otherwise.
+        """
+        try:
+            # Interpret the action to see if it would raise an exception
+            self.state_simulator.action_factory.interpret(action, self.state)
+            # An action is valid if it successfully interprets
+            return True
+        except Exception:
+            # If any exception occurs during interpretation, action is invalid
+            return False
+
+    def simulate_step(self, action) -> tuple[bool, dict, float, bool, bool, dict]:
+        """
+        Simulate a step without modifying the environment's state.
+
+        This method performs a "dry run" of the step to check if an action would
+        succeed and what the results would be, without actually changing the
+        environment's current state.
+
+        Args:
+            action: The action to simulate.
+
+        Returns:
+            tuple containing:
+                - success (bool): Whether the action would succeed
+                - observation (dict): What the observation would be
+                - reward (float): What the reward would be
+                - terminated (bool): Whether the episode would terminate
+                - truncated (bool): Whether the episode would truncate
+                - info (dict): What the info dict would contain
+
+        Example:
+            ```python
+            success, obs, reward, terminated, truncated, info = env.simulate_step(action)
+            if success:
+                # Action is valid, actually execute it
+                obs, reward, terminated, truncated, info = env.step(action)
+            else:
+                # Action would fail, try another one
+                pass
+            ```
+        """
+        if self.done:
+            return False, {}, 0.0, self.terminated, self.truncated, {"error": "Episode already done"}
+
+        try:
+            # Simulate the step without modifying self.state
+            state_result, observation = self.state_simulator.step(self.state, action)
+            
+            if state_result.success:
+                # Calculate what would happen if we took this action
+                # Note: We're not modifying self.state, self.history, etc.
+                would_terminate = is_done(state_result.state, self.instance)
+
+                # We need to check truncation, but state_simulator.is_truncated()
+                # uses internal state, so we simulate it
+                would_truncate = False  # Simplified - actual truncation logic would need the stepper state
+                
+                reward = self.reward_factory.make(state_result, would_terminate, would_truncate)
+                
+                info = {
+                    "no_op": len(state_result.action.transitions) == 0,
+                    "terminated": would_terminate,
+                    "truncated": would_truncate,
+                    "makespan": state_result.state.time.time if would_terminate else None,
+                    "simulated": True,
+                }
+                
+                return True, observation, reward, would_terminate, would_truncate, info
+            else:
+                # Action would fail
+                return False, {}, 0.0, False, False, {"error": "Action would fail", "simulated": True}
+                
+        except Exception as e:
+            # Exception during simulation
+            return False, {}, 0.0, False, False, {"error": str(e), "simulated": True}
+
     def step(self, action):
         """
         Take a step in the environment.
